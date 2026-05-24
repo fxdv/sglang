@@ -1081,11 +1081,15 @@ class DecodePreallocQueue:
             )
 
         if self.scheduler.enable_hisparse:
-            # HiSparse pre-alloc only allocates logical indices (alloc_logical_only),
-            # so the logical pool is the binding constraint for admission control.
+            # HiSparse direct-to-host pre-alloc consumes both logical KV slots
+            # and host slots used as the RDMA destination. The host pool can be
+            # drained independently by decode-time backups, so it must gate
+            # admission together with the logical allocator.
             available_size = (
                 self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
             )
+            host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
+            available_size = min(available_size, host_pool.available_size())
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
@@ -1255,22 +1259,57 @@ class DecodePreallocQueue:
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
             device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
-            )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.req_pool_idx,
-                0,
-                fill_len,
-            )
+            host_indices = None
+
+            def rollback_hisparse_prealloc() -> None:
+                req_pool_idx = req.req_pool_idx
+                if req_pool_idx is not None:
+                    allocated_len = int(
+                        coordinator.req_to_host_pool_allocated_len[req_pool_idx]
+                    )
+                    if allocated_len > 0:
+                        allocated_host_indices = (
+                            coordinator.mem_pool_host.allocated_host_indices(
+                                coordinator.req_to_host_pool,
+                                req_pool_idx,
+                                allocated_len,
+                            )
+                        )
+                        if allocated_host_indices.numel() > 0:
+                            coordinator.mem_pool_host.free(allocated_host_indices)
+                        coordinator.req_to_host_pool[
+                            req_pool_idx, :allocated_len
+                        ].fill_(-1)
+                        coordinator.req_to_host_pool_allocated_len[req_pool_idx] = 0
+                    self.req_to_token_pool.free(req)
+                req.kv_allocated_len = 0
+                req.kv_committed_len = 0
+
+            try:
+                # Allocate host indices for the RDMA transfer target before
+                # logical KV slots so host exhaustion cannot leak logical pages.
+                host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                    coordinator.req_to_host_pool,
+                    coordinator.req_to_host_pool_allocated_len,
+                    req.req_pool_idx,
+                    0,
+                    fill_len,
+                )
+                kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
+                )
+                if kv_loc is None:
+                    raise RuntimeError(
+                        "HiSparse logical KV allocation failed after host prealloc"
+                    )
+            except Exception:
+                rollback_hisparse_prealloc()
+                raise
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
